@@ -402,7 +402,133 @@ class RegionMasterDataWrapper:
     """
     def __init__(self, region: str, name: str):
         self.region = region
+        self.name = name
         self.mgr = MasterDataManager.get(name)
+
+    def _get_fallback_regions(self) -> List[str]:
+        """
+        获取当前 masterdata 在本区服查询失败时的回退区服列表
+        配置示例：
+        masterdata_fallback:
+          cn:
+            enabled: true
+            region: jp
+            names: [shopItems]
+        """
+        cfg = asset_config.get('masterdata_fallback', {})
+        region_cfg = cfg.get(self.region, {})
+        if not region_cfg:
+            return []
+        if not region_cfg.get('enabled', True):
+            return []
+
+        names = region_cfg.get('names', ['*'])
+        if '*' not in names and self.name not in names:
+            return []
+
+        fallback_regions = region_cfg.get('regions', [])
+        if not fallback_regions:
+            fallback_region = region_cfg.get('region')
+            if fallback_region:
+                fallback_regions = [fallback_region]
+        fallback_regions = [r for r in fallback_regions if r and r != self.region]
+        return fallback_regions
+
+    async def _find_by_in_region(self, region: str, key: str, value: Any, mode='first'):
+        # 使用indices优化
+        ind = await self.mgr.get_indexed(region, key)
+        if ind is not None:
+            ret = ind.get(value)
+            if not ret:
+                if mode == 'all':
+                    return []
+                return None
+            if mode == 'first':
+                return ret[0]
+            if mode == 'last':
+                return ret[-1]
+            if mode == 'all':
+                return ret
+            raise ValueError(f"未知的查找模式: {mode}")
+        # 没有索引的情况下遍历查找
+        data = await self.mgr.get_data(region)
+        return find_by(data, key, value, mode)
+
+    async def _collect_by_in_region(self, region: str, key: str, values: Union[List[Any], Set[Any]]):
+        # 使用索引
+        ind = await self.mgr.get_indexed(region, key)
+        if ind is not None:
+            ret = []
+            for value in values:
+                if value in ind:
+                    ret.extend(ind[value])
+            return ret
+        # 没有索引
+        data = await self.mgr.get_data(region)
+        values_set = set(values)
+        ret = []
+        for item in data:
+            if key in item and item[key] in values_set:
+                ret.append(item)
+        return ret
+
+    @staticmethod
+    def _is_empty_result(result: Any, mode: str) -> bool:
+        if mode == 'all':
+            return not result
+        return result is None
+
+    async def _find_by_with_fallback(self, key: str, value: Any, mode='first'):
+        try:
+            result = await self._find_by_in_region(self.region, key, value, mode)
+        except Exception as e:
+            logger.warning(f"MasterData [{self.region}.{self.name}] 查找失败 key={key} value={value}: {get_exc_desc(e)}")
+            result = None if mode != 'all' else []
+
+        if not self._is_empty_result(result, mode):
+            return result
+
+        for fallback_region in self._get_fallback_regions():
+            try:
+                fallback_result = await self._find_by_in_region(fallback_region, key, value, mode)
+                if not self._is_empty_result(fallback_result, mode):
+                    logger.warning(
+                        f"MasterData [{self.region}.{self.name}] 回退到 [{fallback_region}] "
+                        f"查找 key={key} value={value}"
+                    )
+                    return fallback_result
+            except Exception as e:
+                logger.warning(
+                    f"MasterData [{self.region}.{self.name}] 回退 [{fallback_region}] 查找失败: {get_exc_desc(e)}"
+                )
+
+        return result
+
+    async def _collect_by_with_fallback(self, key: str, values: Union[List[Any], Set[Any]]):
+        try:
+            result = await self._collect_by_in_region(self.region, key, values)
+        except Exception as e:
+            logger.warning(f"MasterData [{self.region}.{self.name}] 收集失败 key={key}: {get_exc_desc(e)}")
+            result = []
+
+        if result:
+            return result
+
+        for fallback_region in self._get_fallback_regions():
+            try:
+                fallback_result = await self._collect_by_in_region(fallback_region, key, values)
+                if fallback_result:
+                    logger.warning(
+                        f"MasterData [{self.region}.{self.name}] 回退到 [{fallback_region}] "
+                        f"收集 key={key} values_count={len(values)}"
+                    )
+                    return fallback_result
+            except Exception as e:
+                logger.warning(
+                    f"MasterData [{self.region}.{self.name}] 回退 [{fallback_region}] 收集失败: {get_exc_desc(e)}"
+                )
+
+        return result
     
     async def get(self):
         """
