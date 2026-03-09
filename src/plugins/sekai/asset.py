@@ -552,41 +552,13 @@ class RegionMasterDataWrapper:
         """
         查找item[key]=value的元素，mode=first/last/all
         """
-        # 使用indices优化
-        ind = await self.get_indexed(key)
-        if ind is not None:
-            ret = ind.get(value)
-            if not ret: 
-                if mode == 'all': return []
-                else: return None
-            if mode == 'first': return ret[0]
-            if mode == 'last':  return ret[-1]
-            if mode == 'all': return ret
-            raise ValueError(f"未知的查找模式: {mode}")
-        # 没有索引的情况下遍历查找
-        data = await self.get()
-        return find_by(data, key, value, mode)
+        return await self._find_by_with_fallback(key, value, mode)
 
     async def collect_by(self, key: str, values: Union[List[Any], Set[Any]]):
         """
         收集item[key]在values中的所有元素
         """
-        # 使用索引
-        ind = await self.get_indexed(key)
-        if ind is not None:
-            ret = []
-            for value in values:
-                if value in ind:
-                    ret.extend(ind[value])
-            return ret
-        # 没有索引
-        data = await self.get()
-        values_set = set(values)
-        ret = []
-        for item in data:
-            if item[key] in values_set:
-                ret.append(item)
-        return ret
+        return await self._collect_by_with_fallback(key, values)
                     
     async def find_by_id(self, id: int):
         """
