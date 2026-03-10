@@ -423,10 +423,14 @@ class RegionMasterDataWrapper:
             return []
 
         names = region_cfg.get('names', ['*'])
+        if isinstance(names, str):
+            names = [names]
         if '*' not in names and self.name not in names:
             return []
 
         fallback_regions = region_cfg.get('regions', [])
+        if isinstance(fallback_regions, str):
+            fallback_regions = [fallback_regions]
         if not fallback_regions:
             fallback_region = region_cfg.get('region')
             if fallback_region:
@@ -479,16 +483,19 @@ class RegionMasterDataWrapper:
         return result is None
 
     async def _find_by_with_fallback(self, key: str, value: Any, mode='first'):
+        fallback_regions = self._get_fallback_regions()
         try:
             result = await self._find_by_in_region(self.region, key, value, mode)
-        except Exception as e:
+        except (KeyError, AssertionError, OSError) as e:
+            if not fallback_regions:
+                raise
             logger.warning(f"MasterData [{self.region}.{self.name}] 查找失败 key={key} value={value}: {get_exc_desc(e)}")
             result = None if mode != 'all' else []
 
         if not self._is_empty_result(result, mode):
             return result
 
-        for fallback_region in self._get_fallback_regions():
+        for fallback_region in fallback_regions:
             try:
                 fallback_result = await self._find_by_in_region(fallback_region, key, value, mode)
                 if not self._is_empty_result(fallback_result, mode):
@@ -497,7 +504,7 @@ class RegionMasterDataWrapper:
                         f"查找 key={key} value={value}"
                     )
                     return fallback_result
-            except Exception as e:
+            except (KeyError, AssertionError, OSError) as e:
                 logger.warning(
                     f"MasterData [{self.region}.{self.name}] 回退 [{fallback_region}] 查找失败: {get_exc_desc(e)}"
                 )
@@ -505,16 +512,19 @@ class RegionMasterDataWrapper:
         return result
 
     async def _collect_by_with_fallback(self, key: str, values: Union[List[Any], Set[Any]]):
+        fallback_regions = self._get_fallback_regions()
         try:
             result = await self._collect_by_in_region(self.region, key, values)
-        except Exception as e:
+        except (KeyError, AssertionError, OSError) as e:
+            if not fallback_regions:
+                raise
             logger.warning(f"MasterData [{self.region}.{self.name}] 收集失败 key={key}: {get_exc_desc(e)}")
             result = []
 
         if result:
             return result
 
-        for fallback_region in self._get_fallback_regions():
+        for fallback_region in fallback_regions:
             try:
                 fallback_result = await self._collect_by_in_region(fallback_region, key, values)
                 if fallback_result:
@@ -523,7 +533,7 @@ class RegionMasterDataWrapper:
                         f"收集 key={key} values_count={len(values)}"
                     )
                     return fallback_result
-            except Exception as e:
+            except (KeyError, AssertionError, OSError) as e:
                 logger.warning(
                     f"MasterData [{self.region}.{self.name}] 回退 [{fallback_region}] 收集失败: {get_exc_desc(e)}"
                 )
@@ -752,12 +762,17 @@ async def resource_boxes_download_fn(base_url):
 @MasterDataManager.map_function("costume3ds", regions=COMPACT_DATA_REGIONS)
 def costume3ds_map_fn(costume3ds):
     ret = []
+    dropped = 0
     for item in costume3ds:
         if '_assetbundleName' in item:
             item['assetbundleName'] = item.pop('_assetbundleName')
             ret.append(item)
         elif 'assetbundleName' in item:
             ret.append(item)
+        else:
+            dropped += 1
+    if dropped:
+        logger.warning(f"costume3ds_map_fn: 丢弃了 {dropped} 条缺少 assetbundleName 字段的数据")
     return ret
 
 @MasterDataManager.map_function("virtualLives")
