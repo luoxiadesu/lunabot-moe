@@ -83,6 +83,7 @@ deck:
     tw: https://sekai-data.3-3.dev/music_metas-tc.json 
     en: https://sekai-data.3-3.dev/music_metas-en.json
     kr: https://sekai-data.3-3.dev/music_metas-kr.json
+  music_meta_fallback_fields: ['music_time']
   data_update_interval_seconds: 30
   default_algs: ['dfs', 'ga']
 

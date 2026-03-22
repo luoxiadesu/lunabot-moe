@@ -38,15 +38,124 @@ default_musicmetas_json = WebJsonRes(
 )
 # 获取各个区服的music_meta_urls
 music_meta_urls = config.get("deck.music_meta_urls", {})
-region_musicmetas_json: dict[str, WebJsonRes] = {
+_raw_region_musicmetas_json: dict[str, WebJsonRes] = {
     region: WebJsonRes(
         name=f"{region.upper()}-MusicMeta", 
         url = url,
         update_interval=timedelta(hours=1),
     ) for region, url in music_meta_urls.items()
 }
-def get_musicmetas_json(region:str)->WebJsonRes:
-    return region_musicmetas_json.get(region, default_musicmetas_json)
+MUSICMETA_FALLBACK_FIELDS = set(config.get('deck.music_meta_fallback_fields', ['music_time']))
+
+class MusicMetaStore:
+    def __init__(self, region_res_map: dict[str, WebJsonRes], default_res: WebJsonRes, fallback_region: str = 'jp'):
+        self.region_res_map = region_res_map
+        self.default_res = default_res
+        self.fallback_region = fallback_region
+        self._region_data_cache: dict[str, list[dict]] = {}
+        self._region_hash_cache: dict[str, str] = {}
+        self._region_source_hashes: dict[str, tuple] = {}
+        self._region_fallback_logs: dict[str, set[tuple[int, str, str]]] = {}
+
+    def _get_raw_res(self, region: str) -> WebJsonRes:
+        return self.region_res_map.get(region, self.default_res)
+
+    async def _get_raw_data(self, region: str, timeout: float = 5.0, raise_on_no_data: bool = True) -> list[dict] | None:
+        return await self._get_raw_res(region).get(timeout=timeout, raise_on_no_data=raise_on_no_data)
+
+    async def _get_raw_hash(self, region: str, timeout: float = 5.0, raise_on_no_data: bool = True) -> str | None:
+        return await self._get_raw_res(region).get_hash(timeout=timeout, raise_on_no_data=raise_on_no_data)
+
+    async def get(self, region: str, timeout: float = 5.0, raise_on_no_data: bool = True) -> list[dict] | None:
+        current_hash, fallback_hash = await batch_gather(
+            self._get_raw_hash(region, timeout=timeout, raise_on_no_data=raise_on_no_data),
+            self._get_raw_hash(self.fallback_region, timeout=timeout, raise_on_no_data=raise_on_no_data),
+        )
+        cache_key = (current_hash, fallback_hash)
+        if self._region_source_hashes.get(region) == cache_key:
+            return self._region_data_cache.get(region)
+
+        cur_data, fallback_data = await batch_gather(
+            self._get_raw_data(region, timeout=timeout, raise_on_no_data=raise_on_no_data),
+            self._get_raw_data(self.fallback_region, timeout=timeout, raise_on_no_data=raise_on_no_data),
+        )
+        if not cur_data:
+            if raise_on_no_data:
+                return cur_data
+            self._region_data_cache[region] = None
+            self._region_hash_cache[region] = None
+            self._region_source_hashes[region] = cache_key
+            return None
+
+        fallback_index = {}
+        if fallback_data:
+            fallback_index = {
+                (int(item['music_id']), item['difficulty']): item
+                for item in fallback_data
+                if 'music_id' in item and 'difficulty' in item
+            }
+
+        patched_data = []
+        fallback_logs = set()
+        for item in cur_data:
+            patched = deepcopy(item)
+            fallback_item = fallback_index.get((int(item['music_id']), item['difficulty']))
+            if fallback_item:
+                for field in MUSICMETA_FALLBACK_FIELDS:
+                    if patched.get(field, None) is None and fallback_item.get(field, None) is not None:
+                        patched[field] = fallback_item[field]
+                        fallback_logs.add((int(item['music_id']), item['difficulty'], field))
+            patched_data.append(patched)
+
+        last_logs = self._region_fallback_logs.get(region, set())
+        new_logs = fallback_logs - last_logs
+        if new_logs:
+            show_logs = sorted(new_logs)[:10]
+            msg = ', '.join(f"{region.upper()}-{mid}-{diff}.{field}" for mid, diff, field in show_logs)
+            if len(new_logs) > len(show_logs):
+                msg += f" 等{len(new_logs)}处"
+            logger.warning(f"MusicMeta检测到缺失字段，已回退{self.fallback_region.upper()}数据: {msg}")
+        self._region_fallback_logs[region] = fallback_logs
+
+        region_hash = get_md5(dumps_json(patched_data, indent=False).encode('utf-8'))
+        self._region_data_cache[region] = patched_data
+        self._region_hash_cache[region] = region_hash
+        self._region_source_hashes[region] = cache_key
+        return patched_data
+
+    async def get_hash(self, region: str, timeout: float = 5.0, raise_on_no_data: bool = True) -> str | None:
+        await self.get(region, timeout=timeout, raise_on_no_data=raise_on_no_data)
+        return self._region_hash_cache.get(region)
+
+    async def get_update_time(self, region: str, timeout: float = 5.0, raise_on_no_data: bool = True) -> datetime | None:
+        cur_time, fallback_time = await batch_gather(
+            self._get_raw_res(region).get_update_time(timeout=timeout, raise_on_no_data=raise_on_no_data),
+            self._get_raw_res(self.fallback_region).get_update_time(timeout=timeout, raise_on_no_data=raise_on_no_data),
+        )
+        times = [t for t in (cur_time, fallback_time) if t is not None]
+        return max(times) if times else None
+
+class RegionMusicMetaView:
+    def __init__(self, store: MusicMetaStore, region: str):
+        self.store = store
+        self.region = region
+
+    async def get(self, timeout: float = 5.0, raise_on_no_data: bool = True) -> list[dict] | None:
+        return await self.store.get(self.region, timeout=timeout, raise_on_no_data=raise_on_no_data)
+
+    async def get_hash(self, timeout: float = 5.0, raise_on_no_data: bool = True) -> str | None:
+        return await self.store.get_hash(self.region, timeout=timeout, raise_on_no_data=raise_on_no_data)
+
+    async def get_update_time(self, timeout: float = 5.0, raise_on_no_data: bool = True) -> datetime | None:
+        return await self.store.get_update_time(self.region, timeout=timeout, raise_on_no_data=raise_on_no_data)
+
+musicmeta_store = MusicMetaStore(_raw_region_musicmetas_json, default_musicmetas_json)
+region_musicmetas_json: dict[str, RegionMusicMetaView] = {
+    region: RegionMusicMetaView(musicmeta_store, region)
+    for region in set([*ALL_SERVER_REGIONS, *music_meta_urls.keys()])
+}
+def get_musicmetas_json(region:str)->RegionMusicMetaView:
+    return region_musicmetas_json.get(region, RegionMusicMetaView(musicmeta_store, region))
 
 
 DIFF_NAMES = [
@@ -1526,7 +1635,7 @@ async def get_music_audio_length(ctx: SekaiHandlerContext, mid: int) -> Optional
     musicmetas_json = get_musicmetas_json(ctx.region)
     if musicmetas_json:
         music_metas = await musicmetas_json.get(raise_on_no_data=False)
-    if music_metas and (item := find_by(music_metas, 'music_id', mid)):
+    if music_metas and (item := find_by(music_metas, 'music_id', mid)) and item.get('music_time', None) is not None:
         length = item['music_time']
     else:
         # 尝试从音频文件获取
