@@ -28,8 +28,8 @@ from .card import get_character_sd_image
 from ...imgtool import shrink_image
 
 
-MYSEKAI_REGIONS = ['jp', 'tw', 'cn', 'kr', 'en']
-BD_MYSEKAI_REGIONS = ['cn', 'tw', 'kr']
+MYSEKAI_REGIONS = ['jp', 'tw', 'cn', 'en']
+BD_MYSEKAI_REGIONS = ['cn', 'tw']
 
 bd_msr_sub = SekaiGroupSubHelper("msr", "msr指令权限", BD_MYSEKAI_REGIONS)
 msr_sub = SekaiUserSubHelper("msr", "烤森资源查询自动推送", MYSEKAI_REGIONS, only_one_group=True)
@@ -1972,13 +1972,7 @@ async def compose_mysekai_talk_list_image(
 
 # 获取字节服msr限制uid，不限制则返回None
 def get_bd_msr_limit_uid(ctx: SekaiHandlerContext, qid: int) -> str | None:
-    if ctx.region not in BD_MYSEKAI_REGIONS or int(qid) in SUPERUSER_CFG.get():
-        return None
-    qid = str(qid)
-    msr_binds: dict[str, str] = bd_msr_bind_db.get(f"{ctx.region}_bind", {})
-    if qid not in msr_binds:
-        return update_bd_msr_limit_uid(ctx, qid)
-    return msr_binds[qid]
+    return None
 
 # 切换字节服msr限制uid为当前绑定的ID，返回绑定的ID
 async def update_bd_msr_limit_uid(ctx: SekaiHandlerContext, qid: int, force: bool = False):
