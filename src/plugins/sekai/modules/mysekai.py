@@ -725,7 +725,7 @@ async def compose_mysekai_harvest_map_image(ctx: SekaiHandlerContext, harvest_ma
     return await canvas.get_img()
 
 # 合成mysekai资源图片 返回图片列表
-async def compose_mysekai_res_image(ctx: SekaiHandlerContext, qid: int, show_harvested: bool, check_time: bool) -> List[Image.Image]:
+async def compose_mysekai_res_image(ctx: SekaiHandlerContext, qid: int, show_harvested: bool, check_time: bool, preloaded_info=None) -> List[Image.Image]:
     with ProfileTimer("msr.get_basic_profile"):
         uid = get_player_bind_id(ctx)
 
@@ -739,7 +739,7 @@ async def compose_mysekai_res_image(ctx: SekaiHandlerContext, qid: int, show_har
         basic_profile = await get_basic_profile(ctx, uid)
 
     with ProfileTimer("msr.get_mysekai_info"):
-        mysekai_info, pmsg = await get_mysekai_info(ctx, qid, raise_exc=True)
+        mysekai_info, pmsg = preloaded_info if preloaded_info is not None else await get_mysekai_info(ctx, qid, raise_exc=True)
 
     upload_time = datetime.fromtimestamp(mysekai_info['upload_time'] / 1000)
     if upload_time < get_mysekai_last_refresh_time_and_reason(ctx)[0] and check_time:
@@ -2345,104 +2345,227 @@ async def _(ctx: SekaiHandlerContext):
 
 # ======================= 定时任务 ======================= #
 
-# MSR自动推送 & MSR订阅更新
-@repeat_with_interval(config.item('mysekai.msr_push_interval_seconds'), 'MSR自动推送', logger)
-async def msr_auto_push():
-    for region in ALL_SERVER_REGIONS:
-        region_name = get_region_name(region)
-        ctx = SekaiHandlerContext.from_region(region)
+# Upload events and reconciliation share one durable queue. The receiver never
+# renders images or waits for QQ, so upload is independent of delivery latency.
+from ..msr_delivery import DeliveryStore, create_webhook_app
 
-        get_upload_time_url = get_gameapi_config(ctx).mysekai_upload_time_api_url
-        if not get_upload_time_url: continue
-        if region not in msr_sub.regions: continue
+_msr_store = None
+_msr_wake = None
+_msr_runner = None
+_msr_tasks = []
 
-        # 获取订阅的用户列表和抓包模式
-        qids = list(set([qid for qid, gid in msr_sub.get_all_gid_uid(region)]))
-        uid_modes: list[tuple[int, int]] = []
-        for qid in qids:
-            for i in range(get_player_bind_count(ctx, qid)):
-                try:
-                    if uid := get_player_bind_id(ctx, qid, index=i):
-                        uid_modes.append((uid, get_user_data_mode(ctx, qid)))
-                except:
-                    pass
-        if not uid_modes: continue
 
-        # 向api服务器更新msr订阅信息
-        update_msr_sub_url = get_gameapi_config(ctx).update_msr_sub_api_url
-        if update_msr_sub_url:
-            try:
-                await request_gameapi(update_msr_sub_url, json=uid_modes, method='PUT')
-            except Exception as e:
-                logger.warning(f"更新{region_name}Mysekai订阅信息失败: {get_exc_desc(e)}")
+def _msr_cycle(region, dt=None):
+    ctx = SekaiHandlerContext.from_region(region)
+    return int(get_mysekai_last_refresh_time_and_reason(ctx, dt)[0].timestamp() * 1000)
 
-        # 获取不同uid_mode的Mysekai上传时间
-        try:
-            upload_times: list[int] = await request_gameapi(get_upload_time_url, json=uid_modes)
-        except Exception as e:
-            logger.warning(f"获取{region_name}Mysekai上传时间失败: {get_exc_desc(e)}")
+
+def _msr_targets(region):
+    ctx = SekaiHandlerContext.from_region(region)
+    for qid, gid in msr_sub.get_all_gid_uid(region):
+        if check_in_blacklist(qid) or not gbl.check_id(gid) or check_group_disabled(gid):
             continue
-        upload_times: dict[tuple[str, str], int] = { uid_mode: ts for uid_mode, ts in zip(uid_modes, upload_times) }
-
-        need_push_uid_modes = [] # 需要推送的uid_mode（有及时更新数据并且没有距离太久的）
-        last_refresh_time = get_mysekai_last_refresh_time_and_reason(ctx)[0]
-        for uid_mode, ts in upload_times.items():
-            update_time = datetime.fromtimestamp(ts / 1000)
-            if update_time > last_refresh_time and datetime.now() - update_time < timedelta(minutes=10):
-                need_push_uid_modes.append(uid_mode)
-
-        tasks = []
-                
-        for qid, gid in msr_sub.get_all_gid_uid(region):
-            if check_in_blacklist(qid): continue
-            if not gbl.check_id(gid): continue
-            if region in bd_msr_sub.regions and not bd_msr_sub.is_subbed(region, gid): continue
-            
-            for i in range(get_player_bind_count(ctx, qid)):
-                msr_last_push_time = file_db.get(f"{region}_msr_last_push_time", {})
-
-                uid = get_player_bind_id(ctx, qid, index=i)
-                mode = get_user_data_mode(ctx, qid)
-                if not uid or (uid, mode) not in need_push_uid_modes:
-                    continue
-
-                # 检查这个uid-qid刷新后是否已经推送过
-                key = f"{uid}-{qid}"
-                if key in msr_last_push_time:
-                    last_push_time = datetime.fromtimestamp(msr_last_push_time[key] / 1000)
-                    if last_push_time >= last_refresh_time:
-                        continue
-                msr_last_push_time[key] = int(datetime.now().timestamp() * 1000)
-                file_db.set(f"{region}_msr_last_push_time", msr_last_push_time)
-                
-                tasks.append((gid, qid, uid))
-
-        async def push(task):
-            gid, qid, uid = task
-            user_ctx = SekaiHandlerContext.from_region(region)
-            user_ctx.user_id = int(qid)
-            user_ctx.group_id = int(gid)
-
-            index = get_player_bind_id_index(ctx, qid, uid)
-            if index is None: return
-            user_ctx.uid_arg = f"u{index+1}"
-            
+        if region in bd_msr_sub.regions and not bd_msr_sub.is_subbed(region, gid):
+            continue
+        for i in range(get_player_bind_count(ctx, qid)):
             try:
-                logger.info(f"在 {gid} 中自动推送用户 {qid} 的{region_name}Mysekai资源查询")
-                contents = [
-                    await get_image_cq(img, low_quality=True) for img in 
-                    await compose_mysekai_res_image(user_ctx, qid, False, True)
-                ]
-                contents = [f"[CQ:at,qq={qid}]的{region_name}MSR推送"] + contents
-                await send_group_msg_by_bot(gid, "".join(contents))
-            except MsrIdNotMatchException as e:
-                logger.warning(f'在 {gid} 中自动推送用户 {qid} 的{region_name}Mysekai资源查询失败: 限制id不匹配')
+                uid = str(get_player_bind_id(ctx, qid, index=i))
+                mode = get_user_data_mode(ctx, qid)
+                limit_uid = get_bd_msr_limit_uid(ctx, qid)
+                if limit_uid and str(limit_uid) != uid:
+                    continue
+                # A changed mode/limit can unblock a previous terminal failure.
+                signature = f"{mode}:{limit_uid or ''}"
+                yield dict(region=region, uid=uid, qid=qid, gid=gid, mode=mode, context=signature)
             except Exception as e:
-                logger.print_exc(f'在 {gid} 中自动推送用户 {qid} 的{region_name}Mysekai资源查询失败')
-                try: await send_group_msg_by_bot(gid, f"自动推送用户 [CQ:at,qq={qid}] 的{region_name}Mysekai资源查询失败: {get_exc_desc(e)}")
-                except: pass
+                logger.warning(f"MSR订阅检查失败: {get_exc_desc(e)}")
 
-        await batch_gather(*[push(task) for task in tasks], batch_size=MSR_PUSH_CONCURRENCY_CFG.get())
+
+def _msr_import_legacy(target, cycle):
+    key = f"{target['uid']}-{target['qid']}"
+    last = file_db.get(f"{target['region']}_msr_last_push_time", {}).get(key, 0)
+    if last >= cycle:
+        _msr_store.enqueue(target['region'], target['uid'], target['qid'], target['gid'],
+                           cycle, last, target['context'], completed=True)
+
+
+def _msr_enqueue(region, uid, timestamp):
+    now_ms = int(time.time() * 1000)
+    cycle = _msr_cycle(region)
+    if not cycle <= timestamp <= now_ms:
+        return
+    for target in _msr_targets(region):
+        if target['uid'] != uid:
+            continue
+        _msr_import_legacy(target, cycle)
+        _msr_store.enqueue(region, uid, target['qid'], target['gid'], cycle, timestamp, target['context'])
+
+
+async def msr_auto_push():
+    """Reconcile missed events, without syncing unused subscription snapshots."""
+    for region in msr_sub.regions:
+        try:
+            ctx = SekaiHandlerContext.from_region(region)
+            url = get_gameapi_config(ctx).mysekai_upload_time_api_url
+            if not url:
+                continue
+            cycle = _msr_cycle(region)
+            pairs = set()
+            for target in _msr_targets(region):
+                _msr_import_legacy(target, cycle)
+                state = _msr_store.state(region, target['uid'], target['qid'], cycle)
+                if state not in ('done', 'running', 'pending'):
+                    pairs.add((target['uid'], target['mode']))
+            if not pairs:
+                continue
+            pairs = sorted(pairs)
+            times = await request_gameapi(url, method='POST', json=pairs, timeout=aiohttp.ClientTimeout(total=15))
+            if not isinstance(times, list) or len(times) != len(pairs):
+                raise ValueError('上传时间查询返回数量不符')
+            for (uid, _mode), ts in zip(pairs, times):
+                if type(ts) is int and ts > 0:
+                    _msr_enqueue(region, uid, ts)
+            logger.info(f"MSR补查 {region}: {len(pairs)} 个账号; 队列={_msr_store.stats()}")
+        except Exception:
+            logger.print_exc(f"MSR补查 {region} 失败")
+    _msr_store.cleanup()
+    _msr_wake.set()
+
+
+async def _msr_reconcile_loop():
+    while True:
+        try:
+            await msr_auto_push()
+        except Exception:
+            logger.print_exc('MSR补查失败')
+        # Fixed delay: slow rendering/network never produces catch-up bursts.
+        interval = config.get('mysekai.msr_push_interval_seconds', 300)
+        await asyncio.sleep(max(3, interval))
+
+
+def _msr_current_target(job):
+    if _msr_cycle(job['region']) != job['cycle']:
+        return None
+    return next((t for t in _msr_targets(job['region'])
+                 if t['uid'] == job['uid'] and t['qid'] == job['qid']
+                 and t['gid'] == job['gid'] and t['context'] == job['context']), None)
+
+
+async def _msr_push(job):
+    try:
+        target = _msr_current_target(job)
+        if target is None:
+            _msr_store.finish(job, 'cancelled')
+            return
+        ctx = SekaiHandlerContext.from_region(job['region'])
+        ctx.user_id, ctx.group_id = job['qid'], job['gid']
+        ctx.data_mode_arg = target['mode']
+        index = get_player_bind_id_index(ctx, job['qid'], job['uid'])
+        if index is None:
+            _msr_store.finish(job, 'cancelled')
+            return
+        ctx.uid_arg = f"u{index + 1}"
+        # Validate the actual selected data, which can differ from a local event
+        # for users choosing latest/Haruki. Reuse it in rendering (one download).
+        info, message = await get_mysekai_info(ctx, job['qid'], raise_exc=True)
+        uploaded = info.get('upload_time', 0)
+        if not job['cycle'] <= uploaded <= int(time.time() * 1000):
+            raise ReplyException('当前数据不属于本轮刷新，等待新上传')
+        if _msr_cycle(job['region'], datetime.fromtimestamp(uploaded / 1000)) != job['cycle']:
+            raise ReplyException('当前数据不属于本轮刷新，等待新上传')
+        images = await compose_mysekai_res_image(ctx, job['qid'], False, True, (info, message))
+        contents = [await get_image_cq(img, low_quality=True) for img in images]
+        # Refresh/group membership/bindings may change while images are rendered.
+        if _msr_current_target(job) is None:
+            _msr_store.finish(job, 'cancelled')
+            return
+        region_name = get_region_name(job['region'])
+        result = await send_group_msg_by_bot(job['gid'], f"[CQ:at,qq={job['qid']}]的{region_name}MSR推送" + ''.join(contents))
+        if not result or 'message_id' not in result:
+            raise RuntimeError('QQ未确认发送成功（可能离线或被限流）')
+        _msr_store.finish(job)
+    except Exception as e:
+        terminal = isinstance(e, (MsrIdNotMatchException, ReplyException))
+        retrying = _msr_store.fail(job, get_exc_desc(e), terminal=terminal)
+        logger.warning(f"MSR推送失败 region={job['region']} attempt={job['attempts']} retry={retrying}: {get_exc_desc(e)}")
+        # Failures remain in logs; retries never generate extra group messages.
+        return
+
+    # SQLite is authoritative. A failure to mirror legacy JSON after a confirmed
+    # QQ send must never turn a completed job back into a retry.
+    try:
+        # Keep rollback compatibility. Store the data's cycle, not the send time.
+        last = file_db.get(f"{job['region']}_msr_last_push_time", {})
+        last[f"{job['uid']}-{job['qid']}"] = job['cycle']
+        file_db.set(f"{job['region']}_msr_last_push_time", last)
+        logger.info(f"MSR推送成功 region={job['region']} cycle={job['cycle']} attempt={job['attempts']}")
+    except Exception:
+        logger.print_exc('MSR推送已完成，但回退兼容记录更新失败')
+
+
+async def _msr_delivery_loop():
+    active = set()
+
+    def task_done(task):
+        active.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            logger.error(f'MSR发送任务异常: {get_exc_desc(task.exception())}')
+        _msr_wake.set()
+
+    try:
+        while True:
+            _msr_wake.clear()
+            try:
+                for event in _msr_store.events():
+                    _msr_enqueue(event['region'], event['uid'], event['upload_time'])
+                    _msr_store.handled(event['event_id'])
+                slots = max(0, max(1, MSR_PUSH_CONCURRENCY_CFG.get()) - len(active))
+                for job in _msr_store.claim(slots):
+                    task = asyncio.create_task(_msr_push(job))
+                    active.add(task)
+                    task.add_done_callback(task_done)
+            except Exception:
+                logger.print_exc('MSR队列处理失败')
+            try:
+                slots = max(1, MSR_PUSH_CONCURRENCY_CFG.get()) - len(active)
+                delay = _msr_store.next_delay() if slots > 0 else 3600
+                await asyncio.wait_for(_msr_wake.wait(), timeout=max(0.05, delay))
+            except asyncio.TimeoutError:
+                pass
+    finally:
+        for task in active:
+            task.cancel()
+        await asyncio.gather(*active, return_exceptions=True)
+
+
+@on_startup()
+async def _start_msr_delivery():
+    global _msr_store, _msr_wake, _msr_runner
+    from aiohttp import web
+    _msr_store = DeliveryStore(f"{SEKAI_DATA_DIR}/msr_delivery.sqlite3")
+    _msr_wake = asyncio.Event()
+    if config.get('mysekai.webhook.enabled', False):
+        secret = config.get('mysekai.webhook.secret', '')
+        app = create_webhook_app(_msr_store, secret, _msr_wake)
+        _msr_runner = web.AppRunner(app, access_log=None)
+        await _msr_runner.setup()
+        host = config.get('mysekai.webhook.host', '127.0.0.1')
+        port = config.get('mysekai.webhook.port', 11452)
+        await web.TCPSite(_msr_runner, host, port).start()
+        logger.info(f"MSR Webhook已监听 {host}:{port}")
+    _msr_tasks.extend([asyncio.create_task(_msr_delivery_loop()), asyncio.create_task(_msr_reconcile_loop())])
+
+
+@on_shutdown()
+async def _stop_msr_delivery():
+    if _msr_runner:
+        await _msr_runner.cleanup()
+    for task in _msr_tasks:
+        task.cancel()
+    await asyncio.gather(*_msr_tasks, return_exceptions=True)
+    if _msr_store:
+        _msr_store.close()
+
 
 # 查询烤森材料信息
 pjsk_mysekai_material_info = SekaiCmdHandler([

@@ -144,7 +144,13 @@ gacha:
     pickup: 100
 
 mysekai:
-  msr_push_interval_seconds: 3
+  # 上传通知以外的低频补查；未配置Webhook时也使用此间隔。
+  msr_push_interval_seconds: 300
+  webhook:
+    enabled: false
+    host: 127.0.0.1  # 同机 k3s 可设置宿主机集群网桥地址，如 10.42.0.1
+    port: 11452
+    secret: ""  # 与 upload 的 SEKAI_UPLOAD_WEBHOOK_SECRET 一致，不提交真实密钥
   msr_push_concurrency: 4
 
   map_image_scale: 0.75
