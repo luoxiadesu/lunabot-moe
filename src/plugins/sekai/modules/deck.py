@@ -996,73 +996,16 @@ RECOMMEND_SERVERS_CFG = config.item("deck.servers")
 _deckrec_request_id = 0
 
 
-# 添加OMAKASE音乐
+# The wire schema forces one complete sync after an engine data-contract change.
+from src.services.deck_recommender.compat import (
+    DATA_SCHEMA_VERSION, OPTIONAL_MASTERDATA, prepare_musicmetas,
+)
+
+
 def add_omakase_music(music_metas: list[dict]) -> list[dict]:
-    omakase_diffs = {
-        item.get('difficulty')
-        for item in music_metas
-        if item.get('music_id') == OMAKASE_MUSIC_ID
-    }
-    required_diffs = {'easy', 'normal', 'hard', 'expert', 'master', 'append'}
-    if required_diffs.issubset(omakase_diffs):
-        return music_metas
-    music_metas = [item for item in music_metas if item.get('music_id') != OMAKASE_MUSIC_ID]
+    return prepare_musicmetas(music_metas)[0]
 
-    omakase = {
-        "music_id": OMAKASE_MUSIC_ID,
-        "difficulty": None,
-        "music_time": 0.0,
-        "event_rate": 0.0,
-        "base_score": 0.0,
-        "base_score_auto": 0.0,
-        "skill_score_solo": [0.0 for _ in range(6)],
-        "skill_score_auto": [0.0 for _ in range(6)],
-        "skill_score_multi": [0.0 for _ in range(6)],
-        "fever_score": 0,
-        "fever_end_time": 0,
-        "tap_count": 0,
-    }
 
-    music_count = 0
-    for item in music_metas:
-        if item['difficulty'] in OMAKASE_MUSIC_DIFFS:
-            omakase['music_time'] += item['music_time']
-            omakase['event_rate'] += item['event_rate']
-            omakase['base_score'] += item['base_score']
-            omakase['base_score_auto'] += item['base_score_auto']
-            for i in range(6):
-                omakase['skill_score_solo'][i] += item['skill_score_solo'][i]
-                omakase['skill_score_auto'][i] += item['skill_score_auto'][i]
-                omakase['skill_score_multi'][i] += item['skill_score_multi'][i]
-            omakase['fever_score'] += item['fever_score']
-            omakase['fever_end_time'] += item['fever_end_time']
-            omakase['tap_count'] += item['tap_count']
-            music_count += 1
-
-    if music_count == 0:
-        return music_metas
-
-    omakase['music_time'] /= music_count
-    omakase['event_rate'] = int(omakase['event_rate'] / music_count)
-    omakase['base_score'] /= music_count
-    omakase['base_score_auto'] /= music_count
-    for i in range(6):
-        omakase['skill_score_solo'][i] /= music_count
-        omakase['skill_score_auto'][i] /= music_count
-        omakase['skill_score_multi'][i] /= music_count
-    omakase['fever_score'] /= music_count
-    omakase['fever_end_time'] /= music_count
-    omakase['tap_count'] = int(omakase['tap_count'] / music_count)
-
-    new_music_metas = list(music_metas)
-    for difficulty in ('easy', 'normal', 'hard', 'expert', 'master', 'append'):
-        new_omakase = omakase.copy()
-        new_omakase['difficulty'] = difficulty
-        new_music_metas.append(new_omakase)
-
-    return new_music_metas
-
-# 获取deck的hash
 def get_deck_hash(deck: RecommendDeck) -> str:
     deck_hash = str(deck.score) + str(deck.total_power) + str(deck.cards[0].card_id)
     return deck_hash
@@ -1182,7 +1125,9 @@ async def do_deck_recommend_batch(
         result_dict.setdefault(original_index, []).append(result)
     
     ret = []
-    for index in range(len(options_list)):
+    if len(result_list) != len(original_indices):
+        raise ReplyException("组卡后端返回的结果数量不符")
+    for index, options in enumerate(options_list):
         results = result_dict[index]
         # 结果排序去重
         decks: List[RecommendDeck] = []
@@ -1212,7 +1157,7 @@ async def do_deck_recommend_batch(
                 return deck.multi_live_score_up
             elif options.target == "bonus":
                 return (-deck.event_bonus_rate, deck.score)
-        limit = options.limit if options.target != "bonus" else options.limit * len(options.target_bonus_list)
+        limit = options.limit if options.target != "bonus" else options.limit * max(1, len(options.target_bonus_list or []))
         decks = sorted(decks, key=key_func, reverse=True)[:limit]
         src_algs = [deck_src_alg[get_deck_hash(deck)] for deck in decks]
         res = DeckRecommendResult()
@@ -2239,9 +2184,14 @@ async def _(ctx: SekaiHandlerContext):
 
 DECKREC_DATA_UPDATE_INTERVAL_CFG = config.item('deck.data_update_interval_seconds')
 
+_deckrec_retry_after = {}
+_deckrec_failure_count = {}
+
 @repeat_with_interval(DECKREC_DATA_UPDATE_INTERVAL_CFG, "组卡数据更新", logger)
 async def deckrec_update_data():
     for region in ALL_SERVER_REGIONS:
+        if time.monotonic() < _deckrec_retry_after.get(region, 0):
+            continue
         try:
             ctx = SekaiHandlerContext.from_region(region)
             current_masterdata_version = await ctx.md.get_version()
@@ -2256,6 +2206,7 @@ async def deckrec_update_data():
                     'region': ctx.region,
                     'masterdata_version': str(current_masterdata_version),
                     'musicmetas_update_ts': int(current_musicmetas_update_ts.timestamp()),
+                    'data_schema_version': DATA_SCHEMA_VERSION,
                 }
                 add_payload_segment(payloads, dumps_json(data, indent=False).encode('utf-8'))
 
@@ -2302,18 +2253,35 @@ async def deckrec_update_data():
                         with open(path, 'rb') as f:
                             add_payload_segment(payloads, os.path.basename(path).encode('utf-8'))
                             add_payload_segment(payloads, f.read())
+                    # Use this region's selected source. Missing optional tables
+                    # are explicit empty arrays; network failures abort the sync.
+                    source = await RegionMasterDbManager.get(region).get_latest_source()
+                    for name in OPTIONAL_MASTERDATA:
+                        url = source.base_url.rstrip('/') + '/' + name + '.json'
+                        async with get_client_session().get(url, timeout=aiohttp.ClientTimeout(total=15)) as response:
+                            if response.status == 404:
+                                raw = b'[]'
+                            else:
+                                response.raise_for_status()
+                                raw = await response.read()
+                                if not isinstance(loads_json(raw), list):
+                                    raise ValueError(f'{name} 不是 MasterData 数组')
+                        add_payload_segment(payloads, (name + '.json').encode('utf-8'))
+                        add_payload_segment(payloads, raw)
 
                 if with_musicmetas:
                     logger.info(f"为自动组卡加载 {ctx.region} musicmetas")
                     musicmetas = await musicmetas_json.get()
-                    musicmetas = add_omakase_music(musicmetas)
+                    musicmetas, skipped = prepare_musicmetas(musicmetas)
+                    if skipped:
+                        logger.warning(f"组卡 {region} 跳过 {len(skipped)} 条计分字段不完整的歌曲数据: {skipped[:8]}")
                     add_payload_segment(payloads, b'musicmetas')
                     add_payload_segment(payloads, dumps_json(musicmetas, indent=False).encode('utf-8'))
                 
                 return build_multiparts_payload(payloads)
 
             async def req(url :str, with_masterdata: bool, with_musicmetas: bool):
-                async with get_client_session().post(url + "/update_data", data=await construct_payload(with_masterdata, with_musicmetas)) as resp:
+                async with get_client_session().post(url + "/update_data", data=await construct_payload(with_masterdata, with_musicmetas), timeout=aiohttp.ClientTimeout(total=60)) as resp:
                     if not (with_masterdata or with_musicmetas) and resp.status == 426:
                         data = await resp.json()
                         missing_data = data.get('detail', {}).get('missing_data', [])
@@ -2342,6 +2310,12 @@ async def deckrec_update_data():
 
             for server in RECOMMEND_SERVERS_CFG.get():
                 await req(server['url'], False, False)
+            _deckrec_failure_count.pop(region, None)
+            _deckrec_retry_after.pop(region, None)
 
         except Exception as e:
-            logger.warning(f"更新组卡数据失败 ({region}): {get_exc_desc(e)}")
+            failures = _deckrec_failure_count.get(region, 0) + 1
+            _deckrec_failure_count[region] = failures
+            delay = min(900, 30 * 2 ** min(failures, 5))
+            _deckrec_retry_after[region] = time.monotonic() + delay
+            logger.warning(f"更新组卡数据失败 ({region})，{delay}秒后重试: {get_exc_desc(e)}")

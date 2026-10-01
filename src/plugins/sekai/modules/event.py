@@ -942,6 +942,28 @@ async def compose_event_detail_image(ctx: SekaiHandlerContext, event: dict) -> I
     return await draw(w, h)
 
 # 合成活动记录图片
+def event_record_rank(record: dict) -> int | float | None:
+    rank = record.get('rank')
+    if isinstance(rank, (int, float)) and not isinstance(rank, bool) and math.isfinite(rank) and rank > 0:
+        return rank
+    return None
+
+
+def sort_event_records(records: list[dict]) -> tuple[list[dict], bool]:
+    # Uploaded history can explicitly contain null ranks/points. Keep unranked
+    # records last without changing missing values into fake ranks or scores.
+    has_rank = any(event_record_rank(item) is not None for item in records)
+
+    def key(item):
+        rank = event_record_rank(item)
+        points = item.get('eventPoint')
+        if not isinstance(points, (int, float)) or isinstance(points, bool) or not math.isfinite(points):
+            points = 0
+        return (rank if rank is not None else float('inf'), -points) if has_rank else (-points,)
+
+    return sorted(records, key=key), has_rank
+
+
 async def compose_event_record_image(ctx: SekaiHandlerContext, qid: int) -> Image.Image:
     profile, err_msg = await get_detailed_profile(
         ctx, 
@@ -963,14 +985,8 @@ async def compose_event_record_image(ctx: SekaiHandlerContext, qid: int) -> Imag
     
     async def draw_events(name, user_events):
         topk = 30
-        if any('rank' in item for item in user_events):
-            has_rank = True
-            title = f"排名前{topk}的{name}记录"
-            user_events.sort(key=lambda x: (x.get('rank', 1e9), -x.get('eventPoint', 0)))
-        else:
-            has_rank = False
-            title = f"活动点数前{topk}的{name}记录"
-            user_events.sort(key=lambda x: -x['eventPoint'])
+        user_events, has_rank = sort_event_records(user_events)
+        title = f"排名前{topk}的{name}记录" if has_rank else f"活动点数前{topk}的{name}记录"
 
         user_events = [item for item in user_events if await ctx.md.events.find_by_id(item['eventId'])]
         user_events = user_events[:topk]
@@ -1008,12 +1024,12 @@ async def compose_event_record_image(ctx: SekaiHandlerContext, qid: int) -> Imag
                     with VSplit().set_padding(0).set_sep(sh).set_item_align('c').set_content_align('c'):
                         TextBox("排名", style1).set_h(th).set_content_align('c')
                         for item in user_events:
-                            TextBox(f"#{item.get('rank', '-')}", style3, overflow='clip').set_h(gh).set_content_align('c')
+                            TextBox(f"#{event_record_rank(item) or '-'}", style3, overflow='clip').set_h(gh).set_content_align('c')
                 # 活动点数
                 with VSplit().set_padding(0).set_sep(sh).set_item_align('c').set_content_align('c'):
                     TextBox("PT", style1).set_h(th).set_content_align('c')
                     for item in user_events:
-                        TextBox(f"{item.get('eventPoint', '-')}", style3, overflow='clip').set_h(gh).set_content_align('c')
+                        TextBox(f"{item.get('eventPoint') if item.get('eventPoint') is not None else '-'}", style3, overflow='clip').set_h(gh).set_content_align('c')
 
     with Canvas(bg=SEKAI_BLUE_BG).set_padding(BG_PADDING) as canvas:
         with VSplit().set_content_align('lt').set_item_align('lt').set_sep(16):

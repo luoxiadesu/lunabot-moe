@@ -264,6 +264,12 @@ chart:
 music:
   constant:
     enabled: true # 禁用后使用相关功能会直接提示不可用
-    csv_path: ""  # 歌曲定数csv路径，需包含 id,difficulty,constant 三列
+    csv_path: ""  # 可选本地覆盖，需包含 id,difficulty,constant 三列；空时自动下载
+    sources:  # 基础表 + 覆盖表，与 auburnsummer/pjskb30 一致
+      - "https://docs.google.com/spreadsheets/d/1B8tX9VL2PcSJKyuHFVd2UT_8kYlY4ZdwHwg9MfWOPug/export?format=csv&gid=1855810409"
+      - "https://docs.google.com/spreadsheets/d/1Yv3GXnCIgEIbHL72EuZ-d5q_l-auPgddWi4Efa14jq0/export?format=csv&gid=182216"
+    region_sources: {}  # 如存在区服独立来源，可按 jp/cn/en/tw/kr 指定URL列表
+    refresh_seconds: 21600
     info_text: |
-      该bot的定数表未配置
+      定数来源：pjskb30 基础表＋覆盖表（非官方，JP基准）
+      按当前区服已开放谱面筛选；缺少定数的谱面不计入B30

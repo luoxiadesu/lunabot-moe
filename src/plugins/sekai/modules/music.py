@@ -46,6 +46,7 @@ _raw_region_musicmetas_json: dict[str, WebJsonRes] = {
     ) for region, url in music_meta_urls.items()
 }
 MUSICMETA_FALLBACK_FIELDS = set(config.get('deck.music_meta_fallback_fields', ['music_time']))
+from src.services.deck_recommender.compat import is_complete_musicmeta
 
 class MusicMetaStore:
     def __init__(self, region_res_map: dict[str, WebJsonRes], default_res: WebJsonRes, fallback_region: str = 'jp'):
@@ -420,6 +421,24 @@ class SyncMusicAliasConfig:
         return cls(**(Config('sekai.music_alias_sync').get_all()))
 
 
+def parse_music_alias_response(data: dict, expected_mid: int) -> list[str]:
+    # New Haruki responses wrap aliases in data and omit the requested music ID.
+    # Reject errors/mismatched IDs before replacing an existing local alias list.
+    if not isinstance(data, dict):
+        raise ValueError('歌曲别名响应不是对象')
+    if 'status' in data and data['status'] != 200:
+        raise ValueError(f"歌曲别名服务返回失败: {data.get('status')}")
+    payload = data.get('data', data)
+    if not isinstance(payload, dict):
+        raise ValueError('歌曲别名响应缺少data对象')
+    if 'music_id' in payload and str(payload['music_id']) != str(expected_mid):
+        raise ValueError('歌曲别名响应的ID与请求不一致')
+    aliases = payload.get('aliases')
+    if not isinstance(aliases, list) or not all(isinstance(alias, str) for alias in aliases):
+        raise ValueError('歌曲别名响应缺少有效aliases列表')
+    return aliases
+
+
 # 通过haruki api，同步歌曲别名
 async def sync_music_alias():
     cfg = SyncMusicAliasConfig.get()
@@ -434,10 +453,9 @@ async def sync_music_alias():
     async def sync(mid: int) -> bool:
         try:
             url = cfg.url.format(mid=mid)
-            data = await download_json(url)
+            data = await asyncio.wait_for(download_json(url), timeout=10)
             await asyncio.sleep(cfg.sync_batch_interval)  
-            assert data['music_id'] == mid
-            aliases = data['aliases']
+            aliases = parse_music_alias_response(data, mid)
             # 排除韩语别名
             aliases = [a for a in aliases if not any('\uac00' <= c <= '\ud7af' for c in a)]
             added, removed = alias_db.update(mid, aliases, verbose=False)
@@ -450,6 +468,7 @@ async def sync_music_alias():
             return False
         except Exception as e:
             logger.warning(f"同步歌曲 {mid} 的别名失败: {get_exc_desc(e)}")
+            return False
     updated_num = sum(await batch_gather(*[sync(mid) for mid in mids], batch_size=cfg.sync_batch_size))
     logger.info(f"别名同步完成，{updated_num} 首歌曲的别名发生变更")
     
@@ -759,41 +778,54 @@ async def search_music(ctx: SekaiHandlerContext, query: str, options: MusicSearc
 
 # ======================= 定数获取 ======================= #
 
-_music_constants: dict[tuple[int, str], float] = {}
-_music_constants_mtime: int = None
+from ..music_constants import ConstantsCache, DEFAULT_SOURCES
+from ..suite import best_chart_results
 
-# 获取定数表
-def get_music_constants() -> dict[tuple[int, str], float]:
-    """
-    获取定数表
-    """
-    global _music_constants, _music_constants_mtime
-    if not config.get('music.constant.enabled'):
+_music_constants_info: dict[str, tuple[float, str]] = {}
+_constant_caches = {}
+
+
+async def get_music_constants(region: str = 'jp') -> dict[tuple[int, str], float]:
+    if not config.get('music.constant.enabled', True):
         raise ReplyException("定数相关功能暂不可用")
-    csv_path = config.get('music.constant.csv_path')
-    if not csv_path:
-        return {}
+    sources = config.get('music.constant.sources', list(DEFAULT_SOURCES))
+    region_sources = config.get('music.constant.region_sources', {})
+    sources = region_sources.get(region, sources)
+    # Explicit existing CSV overrides remain supported. A missing old path does
+    # not disable the configured remote sheets (e.g. the former /bot/b30.csv).
+    csv_path = config.get('music.constant.csv_path', '')
+    if csv_path and Path(csv_path).is_file():
+        sources = [csv_path]
+    key = tuple(sources)
+    if key not in _constant_caches:
+        _constant_caches[key] = ConstantsCache(
+            f"{SEKAI_DATA_DIR}/music_constants/{get_md5('|'.join(key))}.json", sources)
+    cache = _constant_caches[key]
+
+    async def fetch_text(source):
+        if not source.startswith(('http://', 'https://')):
+            return await asyncio.to_thread(Path(source).read_text, encoding='utf-8-sig')
+        async with get_client_session().get(source, timeout=aiohttp.ClientTimeout(total=20)) as response:
+            response.raise_for_status()
+            return await response.text()
+
     try:
-        mtime = os.path.getmtime(csv_path)
-        if _music_constants_mtime is None or _music_constants_mtime != mtime:
-            df = pd.read_csv(csv_path)
-            _music_constants = {}
-            for _, row in df.iterrows():
-                mid = int(row['id'])
-                diff = row['difficulty'].lower()
-                constant = float(row['constant'])
-                _music_constants[(mid, diff)] = constant
-            _music_constants_mtime = mtime
-            logger.info(f"成功加载歌曲定数数据，共 {len(_music_constants)} 条记录")
+        data = await cache.get(fetch_text, config.get('music.constant.refresh_seconds', 21600))
     except Exception as e:
-        logger.print_exc(f"加载歌曲定数数据失败")
-    return _music_constants
+        logger.warning(f"读取B30定数表失败: {get_exc_desc(e)}")
+        raise ReplyException("B30定数表暂时无法获取，且没有可用缓存，请稍后再试") from e
+    _music_constants_info[region] = (
+        cache.updated_at, '定数源更新失败，使用上次成功缓存' if cache.last_error else '')
+    return data
 
 # 获取定数说明卡片
-def get_music_constants_info_widget(font_size: int = 20, padding: int = 16, additional_text = None) -> Widget | None:
+def get_music_constants_info_widget(font_size: int = 20, padding: int = 16, additional_text = None, region: str = 'jp') -> Widget | None:
     info_text = config.get('music.constant.info_text', "")
-    if _music_constants_mtime is not None:
-        info_text = f"定数更新时间: {datetime.fromtimestamp(_music_constants_mtime).strftime('%Y-%m-%d %H:%M')}\n" + info_text
+    updated_at, status = _music_constants_info.get(region, (None, ''))
+    if updated_at is not None:
+        info_text = f"定数更新时间: {datetime.fromtimestamp(updated_at).strftime('%Y-%m-%d %H:%M')}\n" + info_text
+    if status:
+        info_text += '\n' + status
     if additional_text:
         info_text += "\n" + additional_text
     if not info_text:
@@ -869,6 +901,8 @@ async def get_music_leaderboard_data(
     # 计算各歌曲数据
     rows: list[dict] = []
     for meta in musicmetas:
+        if not is_complete_musicmeta(meta):
+            continue
         mid = meta['music_id']
         diff = meta['difficulty']
         music_time = meta['music_time']
@@ -1452,8 +1486,8 @@ async def compose_music_list_image(
                 await get_detailed_profile_card(ctx, profile, err_msg)
 
             if show_constant:
-                constants = get_music_constants()
-                get_music_constants_info_widget()
+                constants = await get_music_constants(ctx.region)
+                get_music_constants_info_widget(region=ctx.region)
             else:
                 constants = {}
 
@@ -1967,6 +2001,46 @@ async def get_chart_bpm(ctx: SekaiHandlerContext, mid: int, timeout: float=5.0):
         duration=duration,
     )
 
+async def get_best30_data(ctx: SekaiHandlerContext, profile: dict, constants: dict) -> dict:
+    constant_results: list[dict] = []
+
+    music_results, diagnostics = best_chart_results(profile)
+    assert_and_reply(diagnostics['present'], "Suite抓包缺少打歌成绩，无法计算B30，请重新上传完整Suite抓包")
+    assert_and_reply(not diagnostics['input_rows'] or diagnostics['valid_rows'],
+                     "Suite打歌成绩格式无法识别，不能计算B30，请重新上传抓包")
+    missing_constants = 0
+    qualified_results = 0
+    for (mid, diff), result in music_results.items():
+        if diff not in ('expert', 'master', 'append'):
+            continue
+        if not await is_valid_music(ctx, mid, leak=False, diff=diff):
+            continue
+        result_type = 'ap' if result['fullPerfectFlg'] else 'fc' if result['fullComboFlg'] else None
+        if result_type is None:
+            continue
+        qualified_results += 1
+        if (mid, diff) not in constants:
+            missing_constants += 1
+            continue
+        music = await ctx.md.musics.find_by_id(mid)
+        level = (await get_music_diff_info(ctx, mid)).level[diff]
+        constant = constants[(mid, diff)]
+        # Preserve this bot's existing rating formula, not the website's
+        # different FC reduction and less-than-30 averaging convention.
+        rating = constant if result_type == 'ap' else constant - (1 if level >= 33 else 1.5)
+        constant_results.append({
+            'mid': mid, 'diff': diff, 'level': level, 'title': music['title'],
+            'rating': rating, 'result_type': result_type, 'constant_text': str(constant),
+        })
+    assert_and_reply(constant_results,
+                     "已读取打歌记录，但没有可计入B30的Expert/Master/Append FC/AP成绩，请确认已上传完整Suite抓包" if not qualified_results
+                     else "已有FC/AP成绩，但当前定数表未覆盖这些谱面，暂时无法计算B30")
+    constant_results.sort(key=lambda x: x['rating'], reverse=True)
+    constant_results = constant_results[:30]
+    user_rating = sum([cr['rating'] for cr in constant_results]) / 30
+    return dict(results=constant_results, rating=user_rating, missing_constants=missing_constants, diagnostics=diagnostics)
+
+
 # 合成best30图片
 async def compose_best30_image(ctx: SekaiHandlerContext, qid: int) -> Image.Image:
     profile, err_msg = await get_detailed_profile(
@@ -1977,51 +2051,12 @@ async def compose_best30_image(ctx: SekaiHandlerContext, qid: int) -> Image.Imag
 
     # 数据获取
     with ProfileTimer('b30.get_data'):
-        constants = get_music_constants()
-        constant_results: list[dict] = []
-
-        music_diff_infos: dict[int, MusicDiffInfo] = {}
-        music_results: dict[tuple[int, str], list] = {}
-        for result in profile.get('userMusicResults', []):
-            mid = result['musicId']
-            diff = result.get('musicDifficultyType') or result.get('musicDifficulty')
-            music_results.setdefault((mid, diff), []).append(result)
-            if mid not in music_diff_infos:
-                music_diff_infos[mid] = await get_music_diff_info(ctx, mid)
-
-        for (mid, diff), results in music_results.items():
-            if not await is_valid_music(ctx, mid, leak=False):
-                continue
-            music = await ctx.md.musics.find_by_id(mid)
-            level = music_diff_infos[mid].level.get(diff, None)
-            if not level or not music:
-                continue
-            result_type = None
-            if results:
-                has_clear, full_combo, all_prefect = False, False, False
-                for item in results:
-                    has_clear = has_clear or item["playResult"] != 'not_clear'
-                    full_combo = full_combo or item["fullComboFlg"]
-                    all_prefect = all_prefect or item["fullPerfectFlg"]
-                result_type = "clear" if has_clear else "not_clear"
-                if full_combo: result_type = "fc"
-                if all_prefect: result_type = "ap"
-            rating = None
-            if result_type == 'ap':
-                rating = constants.get((mid, diff), level)
-            elif result_type == 'fc':
-                rating = constants.get((mid, diff), level) - (1 if level >= 33 else 1.5)
-            constant_text = str((constants.get((mid, diff), f"{level}.?")))
-            if rating is not None:
-                constant_results.append({
-                    'mid': mid, 'diff': diff, 'level': level,
-                    'title': music['title'], 'rating': rating,
-                    'result_type': result_type, 'constant_text': constant_text,
-                })
-
-        constant_results.sort(key=lambda x: x['rating'], reverse=True)
-        constant_results = constant_results[:30]
-        user_rating = sum([cr['rating'] for cr in constant_results]) / 30
+        constants = await get_music_constants(ctx.region)
+        data = await get_best30_data(ctx, profile, constants)
+        constant_results = data['results']
+        user_rating = data['rating']
+        missing_constants = data['missing_constants']
+        diagnostics = data['diagnostics']
 
     music_covers = await batch_gather(*[get_music_cover_thumb(ctx, cr['mid']) for cr in constant_results])
     for cr, cover in zip(constant_results, music_covers):
@@ -2037,7 +2072,12 @@ async def compose_best30_image(ctx: SekaiHandlerContext, qid: int) -> Image.Imag
                     style = TextStyle(DEFAULT_BOLD_FONT, 24, BLACK, use_shadow=True, shadow_color=shadow_color, shadow_offset=3)
                     TextBox(f"Rating", style)
                     TextBox(f"{user_rating:.2f}", style.replace(size=48))
-                get_music_constants_info_widget(additional_text="计算方式: 33及以上FC-1，以下-1.5，AP±0").set_bg(None)
+                note = "计算方式: 33及以上FC-1，以下-1.5，AP±0；不足30首按30首计算"
+                if missing_constants:
+                    note += f"\n{missing_constants} 个FC/AP谱面缺少定数，未计入"
+                if diagnostics['invalid_rows']:
+                    note += f"\n{diagnostics['invalid_rows']} 条成绩格式无法识别，结果可能不完整"
+                get_music_constants_info_widget(additional_text=note, region=ctx.region).set_bg(None)
 
             with Grid(col_count=3, hsep=16, vsep=16).set_item_bg(roundrect_bg()).set_content_align('lt').set_content_align('lt'):
                 for cr in constant_results:

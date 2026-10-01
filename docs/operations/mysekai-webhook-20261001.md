@@ -67,3 +67,13 @@ It leaves captures, SQLite history, the outbox and Kubernetes Secret intact.
 The helper restores saved configuration files in full. Review intervening config
 changes before using it later. Future Zeabur rebuilds must include the new upload
 source/configuration; a platform redeploy can overwrite a manually patched image.
+
+
+## 后续自动部署修正
+
+同日精度修复发布后，Zeabur 已接管镜像；早期手动环境变量被平台覆盖。
+已通过 upload `9eb8f65` 增加持久卷私有 `webhook-config.json`，自动部署后
+确认 `webhook=true`，无需再手动固定旧镜像。详见
+[B30 / Suite / upload 部署记录](b30-suite-20261001.md)。
+上面的镜像和观测结果描述首次切换时的状态，回退脚本也保留首次切换语义，
+执行前必须考虑之后的精度修复与持久卷配置。

@@ -1,3 +1,4 @@
+from src.services.deck_recommender.compat import is_complete_musicmeta
 from ...utils import *
 from ..common import *
 from ..handler import *
@@ -258,7 +259,7 @@ async def compose_score_control_image(ctx: SekaiHandlerContext, target_point: in
 def get_custom_room_valid_scores(target_point: int, limit: int = None) -> List[tuple[int, int]]:
     csv_path = f"{SEKAI_DATA_DIR}/custom_room_pt.csv"
     if not os.path.isfile(csv_path):
-        raise ReplyException("未配置自定义房间控分数据文件，无法使用100以下PT控分")
+        raise ReplyException("未配置自定义房间控分数据文件，暂时无法使用自定义房间控分")
     df = pd.read_csv(csv_path)
     ret: List[tuple[int, int]] = []
     # df的第一列是歌曲pt系数，之后每一列的列名是加成，值是对应的pt
@@ -374,6 +375,10 @@ async def compose_music_meta_image(ctx: SekaiHandlerContext, mids: list[int]) ->
                 musicmetas_json = get_musicmetas_json(ctx.region)
                 metas = find_by(await musicmetas_json.get(), "music_id", mid, mode='all')
                 assert_and_reply(metas, f"找不到歌曲ID={mid}的Meta数据")
+                complete_metas = [meta for meta in metas if is_complete_musicmeta(meta)]
+                assert_and_reply(complete_metas, f"歌曲ID={mid}的计分数据不完整，暂时无法查询Meta，请等待数据源更新")
+                skipped_difficulties = [meta.get('difficulty', '?') for meta in metas if not is_complete_musicmeta(meta)]
+                metas = complete_metas
 
                 with VSplit().set_content_align('lt').set_item_align('lt').set_sep(8).set_bg(roundrect_bg()).set_padding(16):
                     # 歌曲标题
@@ -383,6 +388,8 @@ async def compose_music_meta_image(ctx: SekaiHandlerContext, mids: list[int]) ->
                     TextBox(f"以日服为准，参考分数使用5张技能加分100%，数据来源：33Kit", 
                             TextStyle(font=DEFAULT_BOLD_FONT, size=20, color=BLACK))
 
+                    if skipped_difficulties:
+                        TextBox(f"暂缺完整计分数据: {', '.join(skipped_difficulties)}", style2)
                     # 信息
                     with VSplit().set_content_align('lt').set_item_align('lt').set_sep(8).set_item_bg(roundrect_bg()):
                         for meta in metas:

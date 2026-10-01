@@ -1,6 +1,9 @@
 from hashlib import md5
 from fastapi import FastAPI, HTTPException, Request, Response
 import uvicorn
+from contextlib import asynccontextmanager
+from importlib.metadata import version
+from compat import DATA_SCHEMA_VERSION, ENGINE_PACKAGE, ENGINE_VERSION, OPTIONAL_MASTERDATA
 from sekai_deck_recommend_cpp import (
     SekaiDeckRecommend, 
     DeckRecommendOptions, 
@@ -27,16 +30,23 @@ def update_data(
     masterdata: dict[str, bytes] | None,
     musicmetas_update_ts: int,
     musicmetas: bytes | None,
+    data_schema_version: int = 1,
 ):
     db = load_json(DB_PATH, default={})
 
     missing_data = set()
 
     current_masterdata_version = db.get('masterdata_version', {}).get(region)
-    if current_masterdata_version != masterdata_version:
+    current_schema = db.get('data_schema_version', {}).get(region, 1)
+    schema_changed = current_schema != data_schema_version
+    if current_masterdata_version != masterdata_version or schema_changed:
         if not masterdata:
             missing_data.add('masterdata')
         else:
+            if data_schema_version >= DATA_SCHEMA_VERSION:
+                missing_tables = [name for name in OPTIONAL_MASTERDATA if name + '.json' not in masterdata]
+                if missing_tables:
+                    raise HTTPException(status_code=400, detail=f"缺少新版组卡数据表: {missing_tables}")
             local_md_dir = pjoin(DATA_DIR, 'masterdata', region)
             for name, md in masterdata.items():
                 write_file(pjoin(local_md_dir, name), md)
@@ -44,7 +54,7 @@ def update_data(
             log(f"更新 {region} MasterData {current_masterdata_version} -> {masterdata_version}")
 
     current_musicmetas_update_ts = db.get('musicmetas_update_ts', {}).get(region)
-    if current_musicmetas_update_ts != musicmetas_update_ts:
+    if current_musicmetas_update_ts != musicmetas_update_ts or schema_changed:
         if not musicmetas:
             missing_data.add('musicmetas')
         else:
@@ -55,7 +65,10 @@ def update_data(
             local_ts_text = datetime.fromtimestamp(musicmetas_update_ts).strftime('%Y-%m-%d %H:%M:%S')
             log(f"更新 {region} MusicMetas {current_ts_text} -> {local_ts_text}")
 
-    dump_json(db, DB_PATH)
+    if not missing_data:
+        db.setdefault('data_schema_version', {})[region] = data_schema_version
+    if db != load_json(DB_PATH, default={}):
+        dump_json(db, DB_PATH)
     if missing_data:
         log(f"{region} 检测到数据更新不完整，缺少：{', '.join(missing_data)}")
         raise HTTPException(status_code=426, detail={
@@ -82,7 +95,29 @@ async def extract_decompressed_payload(request: Request) -> list[bytes]:
 
 # =========================== API =========================== #
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app):
+    installed = version(ENGINE_PACKAGE)
+    if installed != ENGINE_VERSION:
+        raise RuntimeError(f'Expected {ENGINE_PACKAGE} {ENGINE_VERSION}, got {installed}')
+    WorkerContext.init_workers(WORKER_NUM)
+    log(f'组卡后端 {ENGINE_PACKAGE} {installed}, workers={WORKER_NUM}')
+    try:
+        yield
+    finally:
+        WorkerContext.shutdown()
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.get('/health')
+async def health():
+    return {'status': 'ok', 'engine': ENGINE_PACKAGE, 'version': version(ENGINE_PACKAGE),
+            'data_schema_version': DATA_SCHEMA_VERSION,
+            'workers': len(WorkerContext.all_processes),
+            'alive_workers': sum(p.is_alive() for p in WorkerContext.all_processes.values())}
+
 
 @app.post("/update_data")
 async def _(request: Request):
@@ -104,7 +139,8 @@ async def _(request: Request):
             else:
                 masterdatas[key] = value
             
-        update_data(region, masterdata_version, masterdatas, musicmetas_update_ts, musicmetas)
+        update_data(region, masterdata_version, masterdatas, musicmetas_update_ts, musicmetas,
+                    data.get('data_schema_version', 1))
 
     except HTTPException as he:
         raise he
@@ -191,9 +227,6 @@ async def _(request: Request):
 
 
 if __name__ == "__main__":
-    WorkerContext.init_workers(WORKER_NUM)
-    log(f"组卡服务初始化 worker_num={WORKER_NUM} data_dir={DATA_DIR}")
-
     uvicorn.run(
         "serve:app",
         host=HOST,

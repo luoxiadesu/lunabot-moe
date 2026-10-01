@@ -1193,18 +1193,24 @@ async def get_mysekai_photo_and_time(ctx: SekaiHandlerContext, qid: int, seq: in
     assert_and_reply(seq != 0, "请输入正确的照片编号（从1或-1开始）")
 
     mysekai_info, pmsg = await get_mysekai_info(ctx, qid, raise_exc=True)
-    photos = mysekai_info['updatedResources']['userMysekaiPhotos']
+    photos = mysekai_info.get('updatedResources', {}).get('userMysekaiPhotos')
+    assert_and_reply(photos, "抓包中没有MySekai照片，请先在游戏中拍照并重新上传抓包")
     if seq < 0:
         seq = len(photos) + seq + 1
-    assert_and_reply(seq <= len(photos), f"照片编号大于照片数量({len(photos)})")
-    
+    assert_and_reply(1 <= seq <= len(photos), f"照片编号超出范围，共{len(photos)}张（可用1至{len(photos)}或-1至-{len(photos)}）")
+
     photo = photos[seq-1]
     photo_time = datetime.fromtimestamp(photo['obtainedAt'] / 1000)
 
     url = get_gameapi_config(ctx).mysekai_photo_api_url
     assert_and_reply(url, f"暂不支持查询 {ctx.region} 的MySekai照片")
 
-    image_bytes = await request_gameapi(url, data_type='bytes', json=photo)
+    try:
+        image_bytes = await request_gameapi(url, data_type='bytes', json=photo)
+    except HttpError as e:
+        if e.status_code in (400, 404, 502, 503, 504):
+            raise ReplyException(f"MySekai照片服务暂时无法获取这张照片（HTTP {e.status_code}），请稍后重试；资源和蓝图查询不受影响") from e
+        raise
     return Image.open(io.BytesIO(image_bytes)), photo_time
 
 # 从本地的my.sekai.run网页html提取数据

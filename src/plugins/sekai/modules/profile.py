@@ -1,3 +1,4 @@
+from ..suite import normalize_music_results
 from ...utils import *
 from ..common import *
 from ..handler import *
@@ -630,8 +631,14 @@ async def get_detailed_profile(
         try:   
             url = url.format(uid=uid) + f"?mode={mode}"
             if filter:
-                url += f"&filter={','.join(filter)}"
+                request_fields = set(filter)
+                if 'userMusicResults' in request_fields:
+                    request_fields.update(('compactUserMusicResults', 'userMusics'))
+                url += f"&filter={','.join(sorted(request_fields))}"
             profile = await request_gameapi(url)
+            profile, diagnostics = normalize_music_results(profile)
+            if diagnostics['present']:
+                profile['_music_results_diagnostics'] = diagnostics
         except HttpError as e:
             logger.info(f"获取 {qid} {ctx.region} {uid} 抓包数据失败: {get_exc_desc(e)}")
             if e.status_code == 404:
@@ -1826,6 +1833,16 @@ async def _(ctx: SekaiHandlerContext):
     return await ctx.asend_reply_msg(msg.strip())
 
 
+def load_capture_for_statistics(path: str) -> dict:
+    # Current uploads are plain JSON; older captures may be zstd-compressed.
+    # Detect by the file header, because legacy capture filenames lack a suffix.
+    with open(path, 'rb') as file:
+        data = file.read()
+    if data.startswith(b'\x28\xb5\x2f\xfd'):
+        data = zstandard.ZstdDecompressor().decompress(data)
+    return loads_json(data)
+
+
 # 查询用户统计
 pjsk_user_sta = CmdHandler([
     "/pjsk user sta", "/用户统计",
@@ -1875,12 +1892,12 @@ async def _(ctx: HandlerContext):
             mysekai_source_num: dict[str, int] = {}
             def get_detail():
                 for p in suites:
-                    local_source = load_json_zstd(p).get('local_source', '未知')
+                    local_source = load_capture_for_statistics(p).get('local_source', '未知')
                     suite_source_num[local_source] = suite_source_num.get(local_source, 0) + 1
                 for k, v in suite_source_num.items():
                     suite_source_total[k] = suite_source_total.get(k, 0) + v
                 for p in mysekais:
-                    local_source = load_json_zstd(p).get('local_source', '未知')
+                    local_source = load_capture_for_statistics(p).get('local_source', '未知')
                     mysekai_source_num[local_source] = mysekai_source_num.get(local_source, 0) + 1
                 for k, v in mysekai_source_num.items():
                     mysekai_source_total[k] = mysekai_source_total.get(k, 0) + v

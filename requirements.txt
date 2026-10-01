@@ -76,7 +76,7 @@ yappi==1.7.6
 zstandard==0.25.0
 
 # ── 游戏相关 ──
-sekai-deck-recommend-cpp==0.2.21
+haruki-sekai-deck-recommend-cpp==0.4.2
 
 # ── 可选（懒加载，按需安装）──
 # scikit-learn        # 图片颜色聚类

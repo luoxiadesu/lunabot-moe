@@ -1343,7 +1343,10 @@ async def compose_rank_trace_image(ctx: SekaiHandlerContext, rank: int, event: d
 # 获取胜率预测数据
 async def get_winrate_predict_data(ctx: SekaiHandlerContext):
     assert ctx.region == 'jp', "5v5胜率预测仅支持日服"
-    data = await download_json("https://sekai-data.3-3.dev/cheerful_predict.json")
+    try:
+        data = await download_json("https://sekai-data.3-3.dev/cheerful_predict.json")
+    except HttpError as e:
+        raise ReplyException(f"5v5胜率数据源暂时不可用（HTTP {e.status_code}），请稍后重试") from e
     try:
         event_id = data['eventId']
         predict_time = datetime.fromtimestamp(data['timestamp'] / 1000)
