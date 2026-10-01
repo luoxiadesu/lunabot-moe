@@ -18,18 +18,18 @@ Note: This project is for reference and learning purposes only, and is **not** a
 
 - Install system emoji fonts if emojis fail to render for commands such as `/help`
 
-- Replace the line in `{your_python_dir}/site-packages/pilmoji/helpers.py`:
+- Run `python patch_pilmoji.py` with the bot's Python interpreter after installing
+  or reinstalling dependencies. The pinned Pilmoji 2.0.0 needs this compatibility
+  patch for emoji 2.x. The script also repairs the previous patch that matched
+  English emoji names instead of Unicode characters. Restart the bot and its
+  drawing workers after applying it.
 
-    ```python
-    language_pack: Dict[str, str] = unicode_codes.get_emoji_unicode_dict('en')
-    ```
-
-    with
-    
-    ```python
-    import emoji
-    language_pack: Dict[str, str] = {data['en']: emj for emj, data in emoji.EMOJI_DATA.items() if 'en' in data and data['status'] <= emoji.STATUS['fully_qualified']}
-    ```
+- Pillow-based bot images use Pilmoji to fetch emoji images from the Google-style
+  emoji CDN. Those images are not bundled with pip; installing an emoji font alone
+  does not fix a broken Pilmoji matcher. Browser-rendered images such as `/help`
+  use system fonts separately. Successful assets are cached in
+  `data/utils/emoji_cache`; downloads time out after 3 seconds per source and try
+  Google Noto Emoji as a fallback. A previously cached emoji works offline.
 
 #### 2. Setup Configurations
 
@@ -47,5 +47,4 @@ Note: This project is for reference and learning purposes only, and is **not** a
 - Send a message `@yourbot /enable` to enable the bot in the group.
 
 - (Optional) Start the Sekai Deck Recommendation Service: [README.md](./src/services/deck_recommender/README.md)
-
 

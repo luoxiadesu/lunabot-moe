@@ -9,7 +9,7 @@ from copy import deepcopy
 import math
 from pilmoji import Pilmoji
 from pilmoji import getsize as getsize_emoji
-from pilmoji.source import GoogleEmojiSource
+from .emoji_source import CachedGoogleEmojiSource
 import emoji
 from datetime import datetime, timedelta
 import asyncio
@@ -400,10 +400,9 @@ def get_font_std_size(font: Font) -> Size:
     return font_std_size_cache[font]
 
 def has_emoji(text: str) -> bool:
-    for c in text:
-        if c in emoji.EMOJI_DATA:
-            return True
-    return False
+    # Flags/keycaps/ZWJ emoji consist of multiple code points. In particular,
+    # neither half of a flag is itself an entry in EMOJI_DATA.
+    return bool(emoji.emoji_list(text))
 
 def get_text_size(font: Font, text: str) -> Size:
     if not text: 
@@ -669,7 +668,7 @@ class Painter:
             pos = (pos[0] - text_offset[0] + self.offset[0], pos[1] - text_offset[1] + self.offset[1])
             draw.text(pos, text, font=font, fill=fill, align=align, anchor='ls')
         else:
-            with Pilmoji(self.img, source=GoogleEmojiSource) as pilmoji:
+            with Pilmoji(self.img, source=CachedGoogleEmojiSource) as pilmoji:
                 text_offset = (0, -std_size[1])
                 offset = global_config.get('painter.emoji.offset')
                 scale = global_config.get('painter.emoji.scale')
@@ -801,7 +800,7 @@ class Painter:
         if cache_key is not None:
             t = datetime.now()
             debug_print(f"Cache key: {cache_key}")
-            op_hash = await asyncio.to_thread(deterministic_hash, {"key": cache_key, "op": self.operations})
+            op_hash = await asyncio.to_thread(deterministic_hash, {"key": cache_key, "op": self.operations, "renderer": "emoji-unicode-v1"})
             debug_print(f"Cache key: {cache_key}, op_hash: {op_hash}, elapsed: {datetime.now() - t}")
 
             paths = glob.glob(os.path.join(PAINTER_CACHE_DIR, f"{cache_key}__*.png"))
@@ -1674,4 +1673,3 @@ class Painter:
 
 if PAINTER_PROCESS_NUM > 0 and is_main_process():
     _painter_pool: ProcessPool = ProcessPool(PAINTER_PROCESS_NUM, name='draw')
-
